@@ -1,0 +1,11 @@
+{
+  "domain": "cbus",
+  "name": "C-Bus (C-Gate)",
+  "version": "0.2.0",
+  "documentation": "https://example.com",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@your-github"],
+  "iot_class": "local_push",
+  "config_flow": true
+}
