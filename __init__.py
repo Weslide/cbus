@@ -17,7 +17,7 @@ from .coordinator import CBusCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["light", "sensor"]
+PLATFORMS = ["light", "switch", "fan", "sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):

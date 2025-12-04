@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -10,15 +10,11 @@ from .cgatesession import CGateSession
 
 _LOGGER = logging.getLogger(__name__)
 
-GROUPS_LINE_RE = re.compile(
-    r"^3\d\d[-\s]+//[^:]+:\s+Groups=([0-9,]+)\s*$"
-)
-PARAM_LINE_RE = re.compile(
-    r"^3\d\d[-\s]+//[^:]+:\s+(.*)$"
-)
+GROUPS_LINE_RE = re.compile(r"^3\d\d[-\s]+//[^:]+:\s+Groups=([0-9,]+)\s*$")
+PARAM_LINE_RE = re.compile(r"^3\d\d[-\s]+//[^:]+:\s+(.*)$")
 
 class CBusDiscovery:
-    """Fast discovery using GET for units + DBGET for correct names."""
+    """Discovery using GET + DBGET + name classification."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
@@ -31,25 +27,16 @@ class CBusDiscovery:
         project = self.entry.data[CONF_PROJECT]
         network = str(self.entry.data[CONF_NETWORK])
 
-        model: Dict[str, Any] = {
-            network: {"applications": {}}
-        }
+        model = {network: {"applications": {}}}
 
         await self._safe_cmd(f"project use {project}")
         await self._safe_cmd(f"net open //{project}/{network}")
 
-        # Only lighting app (56)
         model[network]["applications"]["56"] = await self._discover_app(
-            project,
-            network,
-            app_id="56"
+            project, network, "56"
         )
 
         return model
-
-    # ------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------
 
     async def _safe_cmd(self, cmd: str):
         try:
@@ -58,13 +45,9 @@ class CBusDiscovery:
             _LOGGER.warning("Command failed: %s (%s)", cmd, ex)
 
     async def _discover_app(self, project: str, network: str, app_id: str):
-        app = {
-            "type": "lighting",
-            "name": f"Lighting (App {app_id})",
-            "groups": {},
-        }
+        app = {"type": "lighting", "name": f"Lighting {app_id}", "groups": {}}
 
-        # 1) Read Groups list
+        # Read group list
         try:
             lines = await self.session.send_command(
                 f"get //{project}/{network}/{app_id} Groups"
@@ -72,7 +55,7 @@ class CBusDiscovery:
         except:
             return app
 
-        groups: list[int] = []
+        groups = []
         for line in lines:
             m = GROUPS_LINE_RE.match(line)
             if not m:
@@ -87,11 +70,10 @@ class CBusDiscovery:
         if not groups:
             return app
 
-        # 2) For each group: GET + DBGET
+        # Group details
         for gid in groups:
             gpath = f"//{project}/{network}/{app_id}/{gid}"
 
-            # --- 2a) read GET (for Units + Level etc)
             try:
                 glines = await self.session.send_command(f"get {gpath} *")
             except:
@@ -100,14 +82,21 @@ class CBusDiscovery:
             params = self._parse_get_params(glines)
             units = params.get("Units", "").strip()
 
-            # --- 2b) ALWAYS use DBGET for NAME (this is the FIX)
+            # Toolkit name via DBGET
             name = await self._dbget_name(gpath)
             if not name:
                 name = params.get("Name", "").strip() or f"Group {gid}"
-
-            # classify
+            # DEBUG — REMOVE LATER
+            _LOGGER.warning("DISCOVERY: gid=%s name=%s units=%s", gid, name, units)
+    
             device_class, is_load = self._classify(name, units)
-
+            
+            # DEBUG — REMOVE LATER
+            _LOGGER.warning(
+                "CLASSIFY: gid=%s → device_class=%s is_load=%s",
+                gid, device_class, is_load
+            )
+    
             app["groups"][str(gid)] = {
                 "name": name,
                 "device_class": device_class,
@@ -115,35 +104,18 @@ class CBusDiscovery:
                 "units": units,
             }
 
-        _LOGGER.info(
-            "Discovered %d lighting groups with loads on %s",
-            sum(1 for g in app["groups"].values() if g["is_load"]),
-            f"//{project}/{network}/{app_id}",
-        )
-
         return app
 
-    # ------------------------------------------------------------
-    # DBGET NAME RESOLUTION  (From your OLD integration)
-    # ------------------------------------------------------------
-
     async def _dbget_name(self, gpath: str) -> str | None:
-        """Extract TagName using dbget (Toolkit-style names)."""
         try:
             rows = await self.session.send_command(f"dbget {gpath}")
-        except Exception:
+        except:
             return None
 
-        for row in rows:
-            if "TagName=" in row:
-                return (
-                    row.split("TagName=", 1)[1]
-                    .replace('"', "")
-                    .strip()
-                )
+        for r in rows:
+            if "TagName=" in r:
+                return r.split("TagName=", 1)[1].replace('"', "").strip()
         return None
-
-    # ------------------------------------------------------------
 
     def _parse_get_params(self, lines):
         params = {}
@@ -158,26 +130,28 @@ class CBusDiscovery:
             params[k.strip()] = v.strip()
         return params
 
+    # ------------------------------------------------------------
+    # CLASSIFIER (Exhaust → Fan → Relay → Dimmer)
+    # ------------------------------------------------------------
     def _classify(self, name: str, units: str | None):
-        """Accurate dimmer/relay classification based strictly on Units count."""
 
-        # No units → keypad / logic-only → ignore
+        n = (name or "").lower()
+
+        # 1) Exhaust fan (must be FIRST)
+        if "exhaust" in n:
+            return "exhaust", True
+
+        # 2) Ceiling fan
+        if "fan" in n:
+            return "fan", True
+
+        # 3) No units → ignore (keypads)
         if not units or not units.strip():
             return "keypad", False
 
-        # Count units (“3,10,23” → 3 units)
-        unit_list = [u.strip() for u in units.split(",") if u.strip()]
-        unit_count = len(unit_list)
+        # Count relay/dimmer channels
+        unit_count = len([u for u in units.split(",") if u.strip()])
 
-        lower = (name or "").lower()
-
-        # Fan (OFF/33/66/100)
-        if "fan" in lower:
-            return "fan", True
-
-        # Relay output: single unit → switch
         if unit_count == 1:
-            return "switch", True
-
-        # Multi-unit output: dimmer → light
-        return "light", True
+            return "switch", True  # Relay
+        return "light", True       # Dimmer

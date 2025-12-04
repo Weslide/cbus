@@ -84,7 +84,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class CBusFan(FanEntity):
 
     _attr_should_poll = False
-    _attr_supported_features = FanEntityFeature.SET_PERCENTAGE
+    #_attr_supported_features = FanEntityFeature.SET_PERCENTAGE
+    _attr_supported_features = FanEntityFeature.SET_SPEED
+
 
     def __init__(self, coordinator, project, network, app, group, name):
         self.coordinator = coordinator
