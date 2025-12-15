@@ -1,6 +1,6 @@
 # light.py for Home Assistant C-Bus Integration
 import logging
-from typing import Any, List
+from typing import List
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -20,9 +20,8 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
-
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: CBusCoordinator = data["coordinator"]
     model = coordinator.discovery_model
@@ -37,7 +36,6 @@ async def async_setup_entry(
             continue
 
         for group_id, group_info in app56.get("groups", {}).items():
-
             if not group_info.get("is_load", True):
                 continue
             if group_info.get("device_class") != "light":
@@ -52,7 +50,7 @@ async def async_setup_entry(
                     network=str(network_id),
                     app=56,
                     group=int(group_id),
-                    name=name
+                    name=name,
                 )
             )
 
@@ -65,11 +63,11 @@ async def async_setup_entry(
 
 
 class CBusLight(LightEntity):
-
     _attr_should_poll = False
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+    _attr_color_mode = ColorMode.BRIGHTNESS
 
-    def __init__(self, coordinator, project, network, app, group, name):
+    def __init__(self, coordinator: CBusCoordinator, project: str, network: str, app: int, group: int, name: str):
         self.coordinator = coordinator
         self.project = project
         self.network = network
@@ -79,8 +77,7 @@ class CBusLight(LightEntity):
         self._attr_name = name
         self._attr_unique_id = f"cbus_light_{project}_{network}_{app}_{group}"
 
-    async def async_added_to_hass(self):
-        """Initial state + subscribe."""
+    async def async_added_to_hass(self) -> None:
         key = (self.project, self.network, self._app, self._group)
 
         try:
@@ -92,23 +89,18 @@ class CBusLight(LightEntity):
         except Exception:
             pass
 
-        # listen for updates from coordinator
-        self.coordinator.register_callback(
-            self._app, self._group, self._level_update
-        )
-
+        self.coordinator.register_callback(self._app, self._group, self._level_update)
         self.async_write_ha_state()
 
-    def _level_update(self, level: int):
-        """Coordinator event callback."""
+    def _level_update(self, level: int) -> None:
         key = (self.project, self.network, self._app, self._group)
-        self.coordinator.group_levels[key] = level
+        self.coordinator.group_levels[key] = int(level)
         self.async_write_ha_state()
 
     @property
     def _current_level(self) -> int:
         key = (self.project, self.network, self._app, self._group)
-        return self.coordinator.group_levels.get(key, 0)
+        return int(self.coordinator.group_levels.get(key, 0))
 
     @property
     def is_on(self) -> bool:
@@ -120,15 +112,24 @@ class CBusLight(LightEntity):
         return lvl if lvl > 0 else None
 
     async def async_turn_on(self, **kwargs):
-        brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-        brightness = max(0, min(255, int(brightness)))
-
+        brightness = int(kwargs.get(ATTR_BRIGHTNESS, 255))
+    
+        # C-Bus dimmers cannot ramp to 0 → OFF instead
+        if brightness <= 10:
+            await self.async_turn_off()
+            return
+    
         await self.coordinator.session.set_group_level(
-            self.project, self.network, self._app, self._group, brightness
+            self.project,
+            self.network,
+            self._app,
+            self._group,
+            brightness,
         )
 
-    async def async_turn_off(self, **kwargs):
-        """TURN OFF FIX — level 0 always pushed correctly."""
+
+
+    async def async_turn_off(self, **kwargs) -> None:
         await self.coordinator.session.set_group_level(
             self.project, self.network, self._app, self._group, 0
         )
