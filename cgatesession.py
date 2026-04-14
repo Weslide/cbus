@@ -11,19 +11,17 @@ CODE_RE = re.compile(r"^(\d{3})\s")
 # Match group paths and levels:
 # Examples (events or status lines):
 #   701 //MANOR/254/56/6 ... level=0
-#   701 //MANOR/254/56/13 ... level=255
-#   300 //MANOR/254/56/6: level=0
+# Updated to make "level=" optional so it captures the raw number
 GROUP_LEVEL_RE = re.compile(
-    r"//([^/]+)/(\d+)/(\d+)/(\d+).*?level[=\s]+(\d+)",
+    r"//([^/]+)/(\d+)/(\d+)/(\d+).*?(?:level[=\s]+)?(\d+)",
     re.IGNORECASE,
 )
 
 # Match load-change port lines:
 #   lighting on  //MANOR/254/56/6  #...
-#   lighting off //MANOR/254/56/6  #...
-#   lighting ramp //MANOR/254/56/6 level=100 #...
+# Updated to capture the level even if "level=" is omitted
 LIGHTING_RE = re.compile(
-    r"lighting\s+(on|off|ramp)\s+//([^/]+)/(\d+)/(\d+)/(\d+)(?:.*?level[=\s]+(\d+))?",
+    r"lighting\s+(on|off|ramp)\s+//([^/]+)/(\d+)/(\d+)/(\d+)(?:\s+(\d+))?",
     re.IGNORECASE,
 )
 
@@ -252,17 +250,12 @@ class CGateSession:
 
             mcode = CODE_RE.match(line)
 
-            # Use the same parser as the event stream for "701 ... level="
-            # or any line that looks like a state/level update.
-            if not mcode:
-                try:
-                    self._handle_event_line(line)
-                except Exception as exc:
-                    _LOGGER.error(
-                        "Error handling command line as event: %s (line=%s)",
-                        exc,
-                        line,
-                    )
+            # FIX: Always process the line as an event, 
+            # EVEN IF it is the final response code (mcode).
+            try:
+                self._handle_event_line(line)
+            except Exception as exc:
+                _LOGGER.error("Error handling line as event: %s", exc)
 
             if mcode:
                 break
@@ -436,17 +429,6 @@ class CGateSession:
             self._status_writer = None
 
     def _handle_event_line(self, line: str):
-        """Match level, lighting or state events and emit updates."""
-
-        # 1) Any "level=" style events/status:
-        #    701 //MANOR/254/56/6 ... level=255
-        m = GROUP_LEVEL_RE.search(line)
-        if m:
-            project, net, app, group, lvl = m.groups()
-            self._emit_group_update(project, net, int(app), int(group), int(lvl))
-            return
-
-        # 2) Load-change "lighting on/off/ramp" lines
         m_light = LIGHTING_RE.search(line)
         if m_light:
             action, project, net, app, group, lvl = m_light.groups()
@@ -456,16 +438,22 @@ class CGateSession:
                 level = 255
             elif action == "off":
                 level = 0
-            else:  # ramp
+            elif action == "ramp":
+                # If we captured a level number from the positional argument
                 if lvl is not None:
                     try:
                         level = int(lvl)
                     except ValueError:
-                        level = 0
+                        return
                 else:
-                    # If ramp but no level given, very conservative
-                    level = 0
+                    # If it's a ramp but no level is present, don't guess 0
+                    return 
+            else:
+                return
 
+            self._emit_group_update(project, net, int(app), int(group), int(level))
+            return
+    
             self._emit_group_update(project, net, int(app), int(group), int(level))
             return
 

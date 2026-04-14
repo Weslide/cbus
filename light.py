@@ -104,27 +104,36 @@ class CBusLight(LightEntity):
 
     @property
     def is_on(self) -> bool:
-        return self._current_level > 0
+        # Increase threshold to 12 to ignore pre-heat/noise (approx 5%)
+        return self._current_level > 6
 
     @property
     def brightness(self):
         lvl = self._current_level
-        return lvl if lvl > 0 else None
+        if lvl >= 255:
+            return 255
+        # Return None if below the 5% threshold so the UI shows 'Off'
+        return lvl if lvl > 6 else None
 
     async def async_turn_on(self, **kwargs):
+        # If no brightness provided (toggle), default to full
         brightness = int(kwargs.get(ATTR_BRIGHTNESS, 255))
     
-        # C-Bus dimmers cannot ramp to 0 → OFF instead
-        if brightness <= 10:
+        # Ensure we don't send 0 to C-Gate as an 'on' command
+        if brightness <= 5:
             await self.async_turn_off()
             return
     
+        # Send to C-Gate
         await self.coordinator.session.set_group_level(
-            self.project,
-            self.network,
-            self._app,
-            self._group,
-            brightness,
+            self.project, self.network, self._app, self._group, brightness
+        )
+        
+        # UI Optimistic Update: Immediately tell the coordinator we are at this level
+        # This prevents the "jump" while waiting for the C-Gate confirm
+        key = (self.project, self.network, self._app, self._group)
+        self.coordinator.handle_group_update(
+            self.project, self.network, self._app, self._group, brightness
         )
 
 
