@@ -110,17 +110,17 @@ class CBusLight(LightEntity):
     @property
     def brightness(self):
         lvl = self._current_level
-        if lvl >= 255:
-            return 255
+        if lvl > 0:
+            return lvl
+        return None
         # Return None if below the 5% threshold so the UI shows 'Off'
-        return lvl if lvl > 6 else None
 
     async def async_turn_on(self, **kwargs):
         # If no brightness provided (toggle), default to full
         brightness = int(kwargs.get(ATTR_BRIGHTNESS, 255))
     
         # Ensure we don't send 0 to C-Gate as an 'on' command
-        if brightness <= 5:
+        if brightness <= 0:
             await self.async_turn_off()
             return
     
