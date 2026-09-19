@@ -1,9 +1,9 @@
 {
   "domain": "cbus",
   "name": "C-Bus (C-Gate)",
-  "version": "0.2.1",
-  "documentation": "https://example.com",
-  "codeowners": ["@your-github"],
+  "version": "0.3.0",
+  "documentation": "https://github.com/Weslide/cbus",
+  "codeowners": ["@Weslide"],
   "config_flow": true,
   "iot_class": "local_polling",
   "integration_type": "hub",

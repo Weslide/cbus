@@ -1,6 +1,7 @@
 import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
     DOMAIN,
@@ -17,7 +18,7 @@ from .coordinator import CBusCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["light", "switch", "fan", "sensor"]
+PLATFORMS = ["light", "switch", "fan", "sensor", "binary_sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
@@ -54,7 +55,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         _LOGGER.exception("C-Bus discovery failed: %s", exc)
         raise
 
-    # 3) Coordinator
+    # 3) Coordinator — this wires itself up to the session's group-update
+    # and link callbacks (see CBusCoordinator.__init__), so no separate
+    # session.register_global_callback() is needed here. (The previous
+    # version registered both, which meant every event handler ran twice.)
     coordinator = CBusCoordinator(
         hass=hass,
         session=session,
@@ -69,13 +73,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "model": model,
     }
 
-    # 4) Register global event callback
-    def handle_global_event(proj: str, net: str, app: int, grp: int, level: int):
-        coordinator.handle_group_update(proj, net, app, grp, level)
+    # 4) Give the session its network context + a resync hook so the
+    #    keepalive can watch/reopen the C-Bus interface and refresh state
+    #    after a reconnect.
+    session.set_context(project, network)
+    session.set_resync_callback(coordinator.async_resync)
 
-    session.register_global_callback(handle_global_event)
+    # 5) Register the hub device (the C-Gate server / C-Bus network) so it
+    #    shows up in the device registry as its own device.
+    dev_reg = dr.async_get(hass)
+    hub = coordinator.hub_device_info()
+    dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers=hub["identifiers"],
+        manufacturer=hub.get("manufacturer"),
+        name=hub.get("name"),
+        model=hub.get("model"),
+        sw_version=hub.get("sw_version"),
+    )
 
-    # 5) Load platforms (light, sensor)
+    # 6) Load platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     _LOGGER.info("C-Bus integration setup complete for project=%s, network=%s", project, network)

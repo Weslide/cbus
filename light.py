@@ -4,8 +4,10 @@ from typing import List
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_TRANSITION,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -13,6 +15,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import CBusCoordinator
+from .entity import CBusLinkMixin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,35 +27,28 @@ async def async_setup_entry(
 ) -> None:
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: CBusCoordinator = data["coordinator"]
-    model = coordinator.discovery_model
     project = coordinator.project_name
 
     entities: List[CBusLight] = []
 
-    for network_id, network_data in model.items():
-        apps = network_data.get("applications", {})
-        app56 = apps.get("56")
-        if not app56:
+    for network_id, app_id, group_id, group_info in coordinator.lighting_groups():
+        if not group_info.get("is_load", True):
+            continue
+        if group_info.get("device_class") != "light":
             continue
 
-        for group_id, group_info in app56.get("groups", {}).items():
-            if not group_info.get("is_load", True):
-                continue
-            if group_info.get("device_class") != "light":
-                continue
-
-            name = group_info.get("name", f"C-Bus {group_id}")
-
-            entities.append(
-                CBusLight(
-                    coordinator=coordinator,
-                    project=project,
-                    network=str(network_id),
-                    app=56,
-                    group=int(group_id),
-                    name=name,
-                )
+        entities.append(
+            CBusLight(
+                coordinator=coordinator,
+                project=project,
+                network=network_id,
+                app=app_id,
+                group=group_id,
+                name=group_info.get("name", f"C-Bus {group_id}"),
+                dimmable=bool(group_info.get("dimmable", True)),
+                enabled_default=bool(group_info.get("enabled_default", True)),
             )
+        )
 
     if not entities:
         _LOGGER.info("No C-Bus lights found.")
@@ -62,13 +58,30 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class CBusLight(LightEntity):
+class CBusLight(CBusLinkMixin, LightEntity):
     _attr_should_poll = False
-    _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
-    _attr_color_mode = ColorMode.BRIGHTNESS
+    _attr_supported_features = LightEntityFeature.TRANSITION
 
-    def __init__(self, coordinator: CBusCoordinator, project: str, network: str, app: int, group: int, name: str):
+    def __init__(
+        self,
+        coordinator: CBusCoordinator,
+        project: str,
+        network: str,
+        app: int,
+        group: int,
+        name: str,
+        dimmable: bool = True,
+        enabled_default: bool = True,
+    ):
         self.coordinator = coordinator
+        self._dimmable = dimmable
+        self._attr_entity_registry_enabled_default = enabled_default
+        if dimmable:
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+        else:
+            self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
         self.project = project
         self.network = network
         self._app = int(app)
@@ -76,6 +89,7 @@ class CBusLight(LightEntity):
 
         self._attr_name = name
         self._attr_unique_id = f"cbus_light_{project}_{network}_{app}_{group}"
+        self._attr_device_info = coordinator.device_info_for_group(app, group, network)
 
     async def async_added_to_hass(self) -> None:
         key = (self.project, self.network, self._app, self._group)
@@ -90,7 +104,12 @@ class CBusLight(LightEntity):
             pass
 
         self.coordinator.register_callback(self._app, self._group, self._level_update)
+        self._attach_link_listener()
         self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        self.coordinator.unregister_callback(self._app, self._group, self._level_update)
+        self._detach_link_listener()
 
     def _level_update(self, level: int) -> None:
         key = (self.project, self.network, self._app, self._group)
@@ -108,6 +127,8 @@ class CBusLight(LightEntity):
 
     @property
     def brightness(self):
+        if not self._dimmable:
+            return None
         lvl = self._current_level
         if lvl > 0:
             return lvl
@@ -116,27 +137,28 @@ class CBusLight(LightEntity):
     async def async_turn_on(self, **kwargs):
         # If no brightness provided (toggle), default to full
         brightness = int(kwargs.get(ATTR_BRIGHTNESS, 255))
-    
+        transition = kwargs.get(ATTR_TRANSITION)
+
         # Ensure we don't send 0 to C-Gate as an 'on' command
         if brightness <= 0:
-            await self.async_turn_off()
+            await self.async_turn_off(**kwargs)
             return
-    
-        # Send to C-Gate
+
+        # Send to C-Gate (ramp-time supported on C-Gate v3.7.0+; leave the
+        # transition out and this behaves exactly as before)
         await self.coordinator.session.set_group_level(
-            self.project, self.network, self._app, self._group, brightness
+            self.project, self.network, self._app, self._group, brightness,
+            ramp_time=transition,
         )
-        
+
         # UI Optimistic Update: Immediately tell the coordinator we are at this level
         # This prevents the "jump" while waiting for the C-Gate confirm
-        key = (self.project, self.network, self._app, self._group)
         self.coordinator.handle_group_update(
             self.project, self.network, self._app, self._group, brightness
         )
 
-
-
     async def async_turn_off(self, **kwargs) -> None:
         await self.coordinator.session.set_group_level(
-            self.project, self.network, self._app, self._group, 0
+            self.project, self.network, self._app, self._group, 0,
+            ramp_time=kwargs.get(ATTR_TRANSITION),
         )

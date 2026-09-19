@@ -2,8 +2,8 @@
 #
 # Single lighting-group ceiling fan:
 # OFF = 0
-# LOW ≈ 84
-# MED ≈ 163
+# LOW ~= 84
+# MED ~= 163
 # HIGH = 255
 #
 # Matches real C-Gate traffic:
@@ -22,11 +22,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import CBusCoordinator
+from .entity import CBusLinkMixin
 
 _LOGGER = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
-# Exact C-Bus fan levels (from real logs)
+# Exact C-Bus fan levels (from real logs) — UNCHANGED from the working
+# version; do not touch these values.
 # -------------------------------------------------------------------
 
 LEVEL_OFF = 0
@@ -56,7 +58,7 @@ LEVEL_TO_PRESET = {
 # -------------------------------------------------------------------
 
 def _level_to_pct(level: int) -> int:
-    """Convert C-Bus level → HA percentage."""
+    """Convert C-Bus level -> HA percentage."""
     if level <= 0:
         return 0
     if level < 100:      # ~84
@@ -67,7 +69,7 @@ def _level_to_pct(level: int) -> int:
 
 
 def _pct_to_level(percentage: int) -> int:
-    """Convert HA percentage → C-Bus level."""
+    """Convert HA percentage -> C-Bus level."""
     if percentage <= 0:
         return LEVEL_OFF
     if percentage <= 33:
@@ -88,32 +90,27 @@ async def async_setup_entry(
 ) -> None:
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: CBusCoordinator = data["coordinator"]
-    model = coordinator.discovery_model
     project = coordinator.project_name
 
     entities: List[CBusFan] = []
 
-    for network_id, network_data in model.items():
-        app56 = network_data.get("applications", {}).get("56")
-        if not app56:
+    for network_id, app_id, group_id, group_info in coordinator.lighting_groups():
+        if not group_info.get("is_load"):
+            continue
+        if group_info.get("device_class") != "fan":
             continue
 
-        for group_id, group_info in app56.get("groups", {}).items():
-            if not group_info.get("is_load"):
-                continue
-            if group_info.get("device_class") != "fan":
-                continue
-
-            entities.append(
-                CBusFan(
-                    coordinator=coordinator,
-                    project=project,
-                    network=str(network_id),
-                    app=56,
-                    group=int(group_id),
-                    name=group_info.get("name", f"Fan {group_id}"),
-                )
+        entities.append(
+            CBusFan(
+                coordinator=coordinator,
+                project=project,
+                network=network_id,
+                app=app_id,
+                group=group_id,
+                name=group_info.get("name", f"Fan {group_id}"),
+                enabled_default=bool(group_info.get("enabled_default", True)),
             )
+        )
 
     if entities:
         _LOGGER.info("Loaded %d C-Bus fan entities", len(entities))
@@ -126,7 +123,7 @@ async def async_setup_entry(
 # Fan Entity
 # -------------------------------------------------------------------
 
-class CBusFan(FanEntity):
+class CBusFan(CBusLinkMixin, FanEntity):
     """Single-group C-Bus ceiling fan."""
 
     _attr_should_poll = False
@@ -149,8 +146,10 @@ class CBusFan(FanEntity):
         app: int,
         group: int,
         name: str,
+        enabled_default: bool = True,
     ) -> None:
         self.coordinator = coordinator
+        self._attr_entity_registry_enabled_default = enabled_default
         self.project = str(project)
         self.network = str(network)
         self._app = int(app)
@@ -159,6 +158,9 @@ class CBusFan(FanEntity):
         self._attr_name = name
         self._attr_unique_id = (
             f"cbus_fan_{self.project}_{self.network}_{self._app}_{self._group}"
+        )
+        self._attr_device_info = coordinator.device_info_for_group(
+            self._app, self._group, self.network
         )
 
     # ------------------------------------------------------------------
@@ -194,7 +196,7 @@ class CBusFan(FanEntity):
             project=self.project,
             network=self.network,
         )
-
+        self._attach_link_listener()
         self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
@@ -205,6 +207,7 @@ class CBusFan(FanEntity):
             project=self.project,
             network=self.network,
         )
+        self._detach_link_listener()
 
     def _update_from_bus(self, level: int) -> None:
         self.coordinator.group_levels[self._key] = int(level)
@@ -240,6 +243,9 @@ class CBusFan(FanEntity):
         preset_mode: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if preset_mode is not None:
+            await self.async_set_preset_mode(preset_mode)
+            return
         if percentage is not None:
             await self.async_set_percentage(int(percentage))
             return
@@ -257,12 +263,16 @@ class CBusFan(FanEntity):
         await self.coordinator.session.set_group_level(
             self.project, self.network, self._app, self._group, LEVEL_OFF
         )
+        self.coordinator.group_levels[self._key] = LEVEL_OFF
+        self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
         level = _pct_to_level(int(percentage))
         await self.coordinator.session.set_group_level(
             self.project, self.network, self._app, self._group, level
         )
+        self.coordinator.group_levels[self._key] = level
+        self.async_write_ha_state()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         level = PRESET_TO_LEVEL.get(preset_mode)

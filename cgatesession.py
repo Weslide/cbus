@@ -1,9 +1,15 @@
 import asyncio
 import logging
 import re
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 # Match C-Gate response codes: "300 something..."
 CODE_RE = re.compile(r"^(\d{3})\s")
@@ -25,6 +31,14 @@ LIGHTING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# C-Gate tags every event / load-change line with the unit that originated
+# the change:  "... #sourceunit=12 OID=..."  (load-change port)
+#              "... new level=255 sourceunit=12 ramptime=0"  (event port, 730)
+SOURCEUNIT_RE = re.compile(r"#?sourceunit=(\d+)", re.IGNORECASE)
+
+# "300 //PROJ/254/p/12: LightLevel=123"  (GET on a unit parameter)
+PARAM_VALUE_RE = re.compile(r"^3\d\d[-\s]+//[^:]+:\s+([A-Za-z0-9_]+)=(.*)$")
+
 
 class CGateSession:
     """Async connection to C-Gate with event forwarding to HA."""
@@ -44,6 +58,35 @@ class CGateSession:
         self.port_event = port_event
         self.port_status = port_status
         self.keepalive_interval = keepalive_interval
+
+        # Project / network context, set via set_context() so the keepalive
+        # can watch the C-Bus network interface and reopen it if it closes.
+        self.project: Optional[str] = None
+        self.network: Optional[str] = None
+        # How often (in keepalive cycles) to poll InterfaceState.
+        self._netcheck_every = 6
+        self._ka_count = 0
+        self._net_running = True
+        self._resync_running = False
+        # Async callback (coordinator.async_resync) run after a recovery to
+        # refresh HA state for anything missed while the link was down.
+        self._resync_callback: Optional[Callable[[], Any]] = None
+
+        # Link health: True while the command port is up AND (if we know
+        # about it) the C-Bus network interface is running. Entities use
+        # this for availability.
+        self._link_ok = True
+        self._link_callback: Optional[Callable[[bool], None]] = None
+        self.server_version: Optional[str] = None
+        self.stats: Dict[str, Any] = {
+            "reconnects": 0,
+            "stream_reattaches": 0,
+            "resyncs": 0,
+            "last_resync": None,
+            "network_state": None,
+            "last_link_change": None,
+            "last_link_reason": None,
+        }
 
         # Streams
         self._cmd_reader: Optional[asyncio.StreamReader] = None
@@ -74,7 +117,7 @@ class CGateSession:
 
         # Coordinator callback (for HA entities)
         self._group_update_callback: Optional[
-            Callable[[str, str, int, int, int], None]
+            Callable[..., Any]
         ] = None
 
         self._closed = False
@@ -127,8 +170,104 @@ class CGateSession:
     # -------------------------------------------------------------------------
 
     def set_group_update_callback(self, cb):
-        """Coordinator registers a callback for all group-level events."""
+        """Coordinator registers a callback for all group-level events.
+
+        Called as ``cb(project, network, app, group, level, source_unit=...)``.
+        """
         self._group_update_callback = cb
+
+    def set_context(self, project: str, network: str) -> None:
+        """Record project/network so the keepalive can watch the interface."""
+        self.project = project
+        self.network = str(network)
+
+    def set_resync_callback(self, cb: Callable[[], Any]) -> None:
+        """Register an async callback run after a link recovery to refresh state."""
+        self._resync_callback = cb
+
+    def set_link_callback(self, cb: Callable[[bool], None]) -> None:
+        """Register a sync callback invoked when link health changes."""
+        self._link_callback = cb
+
+    @property
+    def link_ok(self) -> bool:
+        return self._link_ok
+
+    def _set_link(self, ok: bool, reason: str) -> None:
+        if ok == self._link_ok:
+            return
+        self._link_ok = ok
+        self.stats["last_link_change"] = _now_iso()
+        self.stats["last_link_reason"] = reason
+        (_LOGGER.info if ok else _LOGGER.warning)(
+            "C-Gate link %s (%s)", "UP" if ok else "DOWN", reason
+        )
+        if self._link_callback:
+            try:
+                self._link_callback(ok)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.error("Link callback failed: %s", exc)
+
+    async def _trigger_resync(self, reason: str) -> None:
+        if self._resync_callback is None or self._resync_running:
+            return
+        self._resync_running = True
+        try:
+            _LOGGER.info("C-Gate link recovered (%s) — resyncing state", reason)
+            await self._resync_callback()
+            self.stats["resyncs"] += 1
+            self.stats["last_resync"] = _now_iso()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Resync after %s failed: %s", reason, exc)
+        finally:
+            self._resync_running = False
+
+    async def check_network(self) -> bool:
+        """Poll the C-Bus network InterfaceState; reopen it if it has closed.
+
+        C-Gate keeps answering ``noop`` on the command port even when the
+        network interface is closed, so the keepalive alone can't tell that
+        events have stopped. Returns True if the interface is running (or if
+        we don't have enough context to check, so we never falsely flag a
+        healthy link as down).
+        """
+        if not self.project or not self.network:
+            return True
+
+        path = f"//{self.project}/{self.network}"
+        try:
+            resp = await self.send_command(f"get {path} InterfaceState")
+        except Exception:  # noqa: BLE001
+            return False  # command-layer problem; handled by reconnect logic
+
+        state = None
+        for line in resp:
+            m = re.search(r"InterfaceState=(\w+)", line)
+            if m:
+                state = m.group(1).lower()
+        self.stats["network_state"] = state
+
+        if state == "running":
+            self._set_link(True, "network running")
+            if not self._net_running:
+                self._net_running = True
+                await self._trigger_resync("network back to running")
+            return True
+
+        # Not running: flag it and (re)open only from a settled closed state,
+        # so we don't spam net-open while it is already opening/syncing.
+        if self._net_running:
+            _LOGGER.warning("C-Bus network %s InterfaceState=%s", path, state)
+        self._net_running = False
+        self._set_link(False, f"network {state}")
+
+        if state in ("closed", "new", None):
+            try:
+                _LOGGER.warning("Reopening C-Bus network %s", path)
+                await self.send_command(f"net open {path}")
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("net open %s failed: %s", path, exc)
+        return False
 
     def register_group_callback(self, project, network, app, group, callback):
         """Legacy per-group callback (kept for flexibility)."""
@@ -139,13 +278,15 @@ class CGateSession:
         """Legacy global callback."""
         self._global_callbacks.append(callback)
 
-    def _emit_group_update(self, project, network, app, group, level):
+    def _emit_group_update(self, project, network, app, group, level, source_unit=None):
         """Unified event fan-out."""
 
-        # 1) Coordinator (primary path)
+        # 1) Coordinator (primary path) — receives the originating unit too
         if self._group_update_callback:
             try:
-                self._group_update_callback(project, network, app, group, level)
+                self._group_update_callback(
+                    project, network, app, group, level, source_unit=source_unit
+                )
             except Exception as exc:
                 _LOGGER.error("Coordinator callback failed: %s", exc)
 
@@ -187,20 +328,58 @@ class CGateSession:
                 return int(m.group(1))
         return None
 
-    async def set_group_level(self, project, network, app, group, level):
-        """Send ON / OFF / RAMP commands."""
+    async def get_unit_param(self, project, network, unit, param):
+        """Read a single parameter of a physical unit, e.g. LightLevel on a PIR.
+
+        Returns the raw string value, or None if C-Gate did not report it.
+        """
+        path = f"//{project}/{network}/p/{int(unit)}"
+        resp = await self.send_command(f"get {path} {param}")
+        for line in resp:
+            m = PARAM_VALUE_RE.match(line)
+            if m and m.group(1).lower() == param.lower():
+                return m.group(2).strip()
+        return None
+
+    @staticmethod
+    def _ramp_time_arg(seconds) -> str | None:
+        """Format an HA transition (s) as a C-Gate ramp-time: 1-2 digits + s|m."""
+        if seconds is None:
+            return None
+        try:
+            s = int(round(float(seconds)))
+        except (TypeError, ValueError):
+            return None
+        if s <= 0:
+            return None
+        if s <= 99:
+            return f"{s}s"
+        return f"{min(99, max(1, round(s / 60)))}m"
+
+    async def set_group_level(self, project, network, app, group, level, ramp_time=None):
+        """Send ON / OFF / RAMP commands.
+
+        ``ramp_time`` (seconds, e.g. HA's ``transition``) makes any level
+        change a timed ramp: ``ramp path level 4s``. Requires a C-Gate that
+        supports the ramp-time argument (confirmed OK on v3.7.0+; older
+        C-Gate v2.x installs may reject it, in which case leave it unset).
+        """
         path = f"//{project}/{network}/{app}/{group}"
-        level = int(level)
+        level = max(0, min(255, int(level)))
+        rt = self._ramp_time_arg(ramp_time)
+
+        if rt:
+            cmd = f"ramp {path} {level} {rt}"
 
         # OFF
-        if level <= 0:
+        elif level <= 0:
             cmd = f"off {path}"
 
         # FULL ON
         elif level >= 255:
             cmd = f"on {path}"
 
-        # STANDARD RAMP (C-Gate v2 does NOT support ramp time or force)
+        # STANDARD RAMP (instant)
         else:
             cmd = f"ramp {path} {level}"
 
@@ -251,7 +430,7 @@ class CGateSession:
 
             mcode = CODE_RE.match(line)
 
-            # FIX: Always process the line as an event, 
+            # FIX: Always process the line as an event,
             # EVEN IF it is the final response code (mcode).
             try:
                 self._handle_event_line(line)
@@ -280,7 +459,12 @@ class CGateSession:
         self._cmd_reader = None
 
         _LOGGER.info("Reconnecting command port...")
-        await self._open_command_connection()
+        try:
+            await self._open_command_connection()
+        except Exception:
+            self._set_link(False, "command port reconnect failed")
+            raise
+        self.stats["reconnects"] += 1
 
     # -------------------------------------------------------------------------
     # Connection open
@@ -289,7 +473,12 @@ class CGateSession:
     async def _open_command_connection(self) -> None:
         reader, writer = await asyncio.open_connection(self.host, self.port_cmd)
         greet = await reader.readline()
-        _LOGGER.debug("Command greeting: %s", greet.decode().strip())
+        greet_txt = greet.decode(errors="ignore").strip()
+        _LOGGER.debug("Command greeting: %s", greet_txt)
+        # "201 Service ready: Clipsal C-Gate Version: v3.7.0 (build 2285) ..."
+        m = re.search(r"Version:\s*(v?[\d.]+(?:\s*\(build \d+\))?)", greet_txt)
+        if m:
+            self.server_version = m.group(1)
         self._cmd_reader = reader
         self._cmd_writer = writer
 
@@ -430,6 +619,9 @@ class CGateSession:
             self._status_writer = None
 
     def _handle_event_line(self, line: str):
+        m_src = SOURCEUNIT_RE.search(line)
+        source_unit = int(m_src.group(1)) if m_src else None
+
         m_light = LIGHTING_RE.search(line)
         if m_light:
             action, project, net, app, group, lvl = m_light.groups()
@@ -448,14 +640,13 @@ class CGateSession:
                         return
                 else:
                     # If it's a ramp but no level is present, don't guess 0
-                    return 
+                    return
             else:
                 return
 
-            self._emit_group_update(project, net, int(app), int(group), int(level))
-            return
-    
-            self._emit_group_update(project, net, int(app), int(group), int(level))
+            self._emit_group_update(
+                project, net, int(app), int(group), int(level), source_unit
+            )
             return
 
         lower = line.lower()
@@ -465,7 +656,9 @@ class CGateSession:
             m2 = re.search(r"//([^/]+)/(\d+)/(\d+)/(\d+)", line)
             if m2:
                 project, net, app, group = m2.groups()
-                self._emit_group_update(project, net, int(app), int(group), 255)
+                self._emit_group_update(
+                    project, net, int(app), int(group), 255, source_unit
+                )
             return
 
         # 4) state=off events (assume 0)
@@ -473,13 +666,17 @@ class CGateSession:
             m2 = re.search(r"//([^/]+)/(\d+)/(\d+)/(\d+)", line)
             if m2:
                 project, net, app, group = m2.groups()
-                self._emit_group_update(project, net, int(app), int(group), 0)
+                self._emit_group_update(
+                    project, net, int(app), int(group), 0, source_unit
+                )
             return
 
         m_level = GROUP_LEVEL_RE.search(line)
         if m_level:
             project, net, app, group, level = m_level.groups()
-            self._emit_group_update(project, net, int(app), int(group), int(level))
+            self._emit_group_update(
+                project, net, int(app), int(group), int(level), source_unit
+            )
             return
 
     # -------------------------------------------------------------------------
@@ -494,6 +691,7 @@ class CGateSession:
           * send 'noop' on the command pipe
           * parse any 701 / level=... lines returned as a full state poll
           * attempt to reconnect the EVENT and LOAD-CHANGE ports if they dropped
+          * periodically confirm the C-Bus network interface is still open
         """
         try:
             while not self._closed:
@@ -504,10 +702,14 @@ class CGateSession:
                     await self.send_command("noop")
                 except Exception as exc:
                     _LOGGER.warning("Keepalive failed: %s", exc)
+                    self._set_link(False, "command port unreachable")
                     # Don't immediately kill the loop; we may recover.
                     continue
+                if self._net_running:
+                    self._set_link(True, "command port ok")
 
                 loop = asyncio.get_running_loop()
+                reattached = False
 
                 # 2) If EVENT stream has died, try to reconnect it in the background
                 if self._event_reader is None and not self._closed:
@@ -518,6 +720,7 @@ class CGateSession:
                                 self._read_event_stream()
                             )
                             _LOGGER.info("Reattached C-Gate EVENT stream after loss")
+                            reattached = True
                     except Exception as exc2:
                         _LOGGER.warning(
                             "Failed to reconnect EVENT port: %s", exc2
@@ -534,10 +737,24 @@ class CGateSession:
                             _LOGGER.info(
                                 "Reattached C-Gate LOAD-CHANGE stream after loss"
                             )
+                            reattached = True
                     except Exception as exc3:
                         _LOGGER.warning(
                             "Failed to reconnect LOAD-CHANGE port: %s", exc3
                         )
+
+                # 4) Periodically confirm the C-Bus network is still open.
+                #    (noop keeps succeeding even when the interface has closed,
+                #    which would silently stop all events.)
+                self._ka_count += 1
+                if self._ka_count % self._netcheck_every == 0 and not self._closed:
+                    await self.check_network()
+
+                # 5) A stream reattach means we were blind for a moment —
+                #    refresh state so entities aren't left stale.
+                if reattached and not self._closed:
+                    self.stats["stream_reattaches"] += 1
+                    await self._trigger_resync("event stream reattach")
 
         except asyncio.CancelledError:
             return
