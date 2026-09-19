@@ -205,7 +205,8 @@ class CGateSession:
             cmd = f"ramp {path} {level}"
 
         _LOGGER.debug("CMD >> %s", cmd)
-        resp = await self._send_and_wait(cmd, retries=1)
+        async with self._cmd_lock:
+            resp = await self._send_and_wait(cmd, retries=1)
         _LOGGER.debug("CMD << %s", "; ".join(resp))
 
     async def _send_and_wait(self, cmd: str, retries: int = 0) -> List[str]:
@@ -473,6 +474,12 @@ class CGateSession:
             if m2:
                 project, net, app, group = m2.groups()
                 self._emit_group_update(project, net, int(app), int(group), 0)
+            return
+
+        m_level = GROUP_LEVEL_RE.search(line)
+        if m_level:
+            project, net, app, group, level = m_level.groups()
+            self._emit_group_update(project, net, int(app), int(group), int(level))
             return
 
     # -------------------------------------------------------------------------
