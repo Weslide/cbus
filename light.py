@@ -104,8 +104,7 @@ class CBusLight(LightEntity):
 
     @property
     def is_on(self) -> bool:
-        # Increase threshold to 12 to ignore pre-heat/noise (approx 5%)
-        return self._current_level > 6
+        return self._current_level > 0
 
     @property
     def brightness(self):
@@ -113,7 +112,6 @@ class CBusLight(LightEntity):
         if lvl > 0:
             return lvl
         return None
-        # Return None if below the 5% threshold so the UI shows 'Off'
 
     async def async_turn_on(self, **kwargs):
         # If no brightness provided (toggle), default to full
