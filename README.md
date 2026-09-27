@@ -148,5 +148,5 @@ left stale.
 ## Credits
 
 - [Dave Oxley](https://github.com/daveoxley) — original CBUS Python library
-- Scott Linton — C-Bus openHAB add-on (https://github.com/scottgl/openhab-addon-cbus), the reference this integration's
+- [Scott Linton]([https://github.com/daveoxley](https://github.com/scottgl/openhab-addon-cbus))Scott Linton — C-Bus openHAB add-on, the reference this integration's
   C-Gate protocol handling was originally modelled on
